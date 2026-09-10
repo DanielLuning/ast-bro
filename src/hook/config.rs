@@ -97,10 +97,20 @@ impl KeepSource {
     }
 
     /// Add one config's patterns, rooted at `root`. A missing file is silent.
+    ///
+    /// The root is resolved here rather than trusted, because [`covers`] compares
+    /// it against a canonicalized path and `dirs::home_dir()` hands back `$HOME`
+    /// as spelled. A home behind a symlink would then match nothing and say
+    /// nothing — a policy that looks applied and is not, which is the failure
+    /// this key exists to prevent. `find_root_for` already returns a canonical
+    /// path; resolving again is a no-op there.
+    ///
+    /// [`covers`]: Self::covers
     fn add(&mut self, config: PathBuf, root: PathBuf) {
         let Ok(text) = std::fs::read_to_string(&config) else {
             return;
         };
+        let root = root.canonicalize().unwrap_or(root);
         let doc = match text.parse::<toml_edit::DocumentMut>() {
             Ok(doc) => doc,
             Err(e) => {
@@ -307,6 +317,35 @@ mod tests {
         let mut policy = KeepSource::default();
         policy.add(user, home.path().canonicalize().unwrap());
         assert!(!policy.covers(&outside));
+    }
+
+    /// A root reached through a symlink still matches.
+    ///
+    /// `dirs::home_dir()` reports `$HOME` as spelled, and `covers` compares
+    /// against a canonicalized path — so a home behind a symlink used to match
+    /// nothing and report nothing, leaving the policy silently inert. Caught by
+    /// running the real hook with `HOME` pointed at a temp dir under `/tmp`,
+    /// which macOS canonicalizes to `/private/tmp`; the unit tests above could
+    /// not see it because they pass a root already resolved.
+    #[test]
+    fn a_root_reached_through_a_symlink_still_matches() {
+        let real = TempDir::new().unwrap();
+        let link_parent = TempDir::new().unwrap();
+        let link = link_parent.path().join("home-link");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+
+        let config = real.path().join("config.toml");
+        std::fs::write(&config, "[hook]\nkeep_source = [\"**/SKILL.md\"]\n").unwrap();
+        let skill = touch(&real, ".claude/skills/sweep/SKILL.md");
+
+        let mut policy = KeepSource::default();
+        // The un-resolved spelling, as `dirs::home_dir()` would hand it over.
+        policy.add(link.join("config.toml"), link.clone());
+        assert!(
+            policy.covers(&skill),
+            "a policy must not go inert because its root was spelled through a link"
+        );
+        let _ = config;
     }
 
     /// A config with other sections but no `keep_source` is not an error.
