@@ -77,10 +77,11 @@ impl KeepSource {
     /// Read every policy that governs `file`: the user's, and the one belonging
     /// to its project when it has one.
     ///
-    /// Absent config, an unreadable one, and one with no `keep_source` key are
-    /// the same answer — nothing added — because the common case is a machine
-    /// that has never heard of this file. A config that exists but cannot be
-    /// parsed is the exception: silently ignoring it would hide the policy while
+    /// An absent config and one with no `keep_source` key are the same answer —
+    /// nothing added — because the common case is a machine that has never
+    /// heard of this file. The exception is a config that exists and still
+    /// cannot take effect: unreadable, unparseable, or holding a `keep_source`
+    /// of the wrong shape. Ignoring that silently would hide the policy while
     /// looking like it applied, so it warns.
     pub fn for_file(file: &Path) -> Self {
         let mut out = Self::default();
@@ -107,8 +108,13 @@ impl KeepSource {
     ///
     /// [`covers`]: Self::covers
     fn add(&mut self, config: PathBuf, root: PathBuf) {
-        let Ok(text) = std::fs::read_to_string(&config) else {
-            return;
+        let text = match std::fs::read_to_string(&config) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                eprintln!("# note: {} could not be read: {e}", config.display());
+                return;
+            }
         };
         let root = root.canonicalize().unwrap_or(root);
         let doc = match text.parse::<toml_edit::DocumentMut>() {
@@ -118,23 +124,37 @@ impl KeepSource {
                 return;
             }
         };
-        let patterns = doc
+        let Some(item) = doc
             .get("hook")
             .and_then(|i| i.as_table_like())
             .and_then(|t| t.get("keep_source"))
-            .and_then(|i| i.as_array());
-        let Some(patterns) = patterns else {
+        else {
+            return;
+        };
+        // `keep_source = "SKILL.md"` parses, and a lookup that only asks for an
+        // array would read it as absent — the policy inert, and nothing said.
+        let Some(patterns) = item.as_array() else {
+            eprintln!(
+                "# note: {}: keep_source is not an array of strings, so none of it applies",
+                config.display()
+            );
             return;
         };
         let mut builder = GitignoreBuilder::new(&root);
         for value in patterns.iter() {
-            if let Some(line) = value.as_str() {
-                if let Err(e) = builder.add_line(None, line) {
-                    eprintln!(
-                        "# note: {}: bad keep_source pattern {line:?}: {e}",
-                        config.display()
-                    );
-                }
+            let Some(line) = value.as_str() else {
+                eprintln!(
+                    "# note: {}: keep_source entry {} is not a string; skipped",
+                    config.display(),
+                    value.to_string().trim()
+                );
+                continue;
+            };
+            if let Err(e) = builder.add_line(None, line) {
+                eprintln!(
+                    "# note: {}: bad keep_source pattern {line:?}: {e}",
+                    config.display()
+                );
             }
         }
         if let Ok(matcher) = builder.build() {
