@@ -347,6 +347,7 @@ mod tests {
     /// running the real hook with `HOME` pointed at a temp dir under `/tmp`,
     /// which macOS canonicalizes to `/private/tmp`; the unit tests above could
     /// not see it because they pass a root already resolved.
+    #[cfg(unix)]
     #[test]
     fn a_root_reached_through_a_symlink_still_matches() {
         let real = TempDir::new().unwrap();
@@ -365,7 +366,6 @@ mod tests {
             policy.covers(&skill),
             "a policy must not go inert because its root was spelled through a link"
         );
-        let _ = config;
     }
 
     /// A config with other sections but no `keep_source` is not an error.

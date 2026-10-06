@@ -31,11 +31,12 @@ pub fn decide(event: &ToolCallEvent, opts: &DecideOpts, channel: Channel) -> Dec
     if !crate::main_helpers::can_parse_for_hook(path) {
         return Decision::PassThrough;
     }
-    // A path the repository asked to receive in full, per `.ast-bro.toml`. It
-    // outranks `always`, which only lowers the bar on file size, because this is
-    // not a claim about size: no length makes an index stand in for a document
-    // that has to be read whole. The additive channel still renders a map, where
-    // the read returned nothing for it to withhold and the alternative is a bare
+    // A path its owner asked to receive in full: `keep_source`, in the user's
+    // config or the project's `.ast-bro.toml` (see `config`). It outranks
+    // `always`, which only lowers the bar on file size, because this is not a
+    // claim about size: no length makes an index stand in for a document that
+    // has to be read whole. The additive channel still renders a map, where the
+    // read returned nothing for it to withhold and the alternative is a bare
     // error.
     if !channel.is_additive() && super::config::KeepSource::for_file(path).covers(path) {
         return Decision::PassThrough;

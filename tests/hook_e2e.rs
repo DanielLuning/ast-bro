@@ -247,6 +247,93 @@ fn unknown_protocol_exits_nonzero() {
     assert!(stderr.contains("unknown --protocol"));
 }
 
+/// `keep_source` in a project's `.ast-bro.toml` hands a listed file over whole
+/// on both channels that would otherwise put a map in its place — `--always`
+/// included, since that flag is about size and this policy is not. An unlisted
+/// file of the same shape is still mapped, so the pass-through is the
+/// policy's doing and not the fixture's.
+#[test]
+fn keep_source_in_a_project_config_delivers_the_file_whole() {
+    let home = TempDir::new().unwrap();
+    let repo = repo_with_config("[hook]\nkeep_source = [\"docs/runbooks/**\"]\n");
+    let runbook = big_doc(&repo.path().join("docs/runbooks/deploy.md"));
+    let readme = big_doc(&repo.path().join("docs/README.md"));
+
+    for event in ["PreToolUse", "PostToolUse"] {
+        for args in [&["--min-lines", "200"][..], &["--always"][..]] {
+            let (stdout, _, code) =
+                run_hook_with_home(home.path(), "claude-code", &read_event(event, &runbook), args);
+            assert_eq!(code, 0);
+            assert!(
+                stdout.contains("\"continue\":true"),
+                "{event} {args:?}: a listed file must arrive whole: {stdout}"
+            );
+            let (stdout, _, _) =
+                run_hook_with_home(home.path(), "claude-code", &read_event(event, &readme), args);
+            assert!(
+                !stdout.contains("\"continue\":true"),
+                "{event} {args:?}: an unlisted file must still be mapped: {stdout}"
+            );
+        }
+    }
+}
+
+/// A read the host refused still gets its map beside the error. There is no
+/// delivered file there for a map to stand in for, and withholding it would
+/// leave a bare error — the one exception the README documents.
+#[test]
+fn keep_source_still_augments_a_read_the_host_refused() {
+    let home = TempDir::new().unwrap();
+    let repo = repo_with_config("[hook]\nkeep_source = [\"docs/runbooks/**\"]\n");
+    let runbook = big_doc(&repo.path().join("docs/runbooks/deploy.md"));
+    let (stdout, _, code) = run_hook_with_home(
+        home.path(),
+        "claude-code",
+        &read_event("PostToolUseFailure", &runbook),
+        &["--min-lines", "200"],
+    );
+    assert_eq!(code, 0);
+    assert!(stdout.contains(r#""additionalContext""#), "stdout: {stdout}");
+}
+
+/// The user-level config, read through a `$HOME` that is a symlink.
+///
+/// This is the case the key was written for — a skill under the home
+/// directory, in no repository — and the shape that once left the policy
+/// inert: `dirs::home_dir()` hands `$HOME` over as spelled while the file side
+/// was canonicalized, so the two never compared equal and nothing said so. The
+/// unit tests reach `add` with a root they chose; only a real process resolves
+/// the home the way an installed hook does. The link is explicit so this fails
+/// on Linux too, where the temp directory is not behind one.
+#[cfg(unix)]
+#[test]
+fn keep_source_in_the_user_config_applies_through_a_linked_home() {
+    let real = TempDir::new().unwrap();
+    let links = TempDir::new().unwrap();
+    let home = links.path().join("home");
+    std::os::unix::fs::symlink(real.path(), &home).unwrap();
+    let config = home.join(".config/ast-bro/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[hook]\nkeep_source = [\"**/SKILL.md\"]\n").unwrap();
+    let skill = big_doc(&home.join(".claude/skills/sweep/SKILL.md"));
+    let notes = big_doc(&home.join(".claude/skills/sweep/notes.md"));
+
+    let args = ["--min-lines", "200"];
+    let (stdout, _, code) =
+        run_hook_with_home(&home, "claude-code", &read_event("PreToolUse", &skill), &args);
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("\"continue\":true"),
+        "a user pattern must reach a skill under a linked home: {stdout}"
+    );
+    let (stdout, _, _) =
+        run_hook_with_home(&home, "claude-code", &read_event("PreToolUse", &notes), &args);
+    assert!(
+        stdout.contains("\"decision\":\"block\""),
+        "and must not spill onto its neighbours: {stdout}"
+    );
+}
+
 /// A `keep_source` of the wrong shape says so instead of passing for a policy
 /// that applied. A string where the array belongs protects nothing, so the
 /// file is still mapped; a non-string entry is skipped while the valid
