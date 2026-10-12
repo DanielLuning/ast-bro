@@ -551,20 +551,15 @@ impl<'s> Walker<'s> {
         };
         let written = _text(first);
 
+        let signature = _module_signature(node, keyword, &written);
         let (kind, names, mut bases, native) = match keyword {
             "defprotocol" => (
                 DeclarationKind::Interface,
-                vec![(written.clone(), format!("defprotocol {}", written))],
+                vec![(written.clone(), signature)],
                 Vec::new(),
                 "protocol",
             ),
             "defimpl" => {
-                let args_text = node
-                    .children()
-                    .find(|c| c.kind() == "arguments")
-                    .map(|a| _text(&a))
-                    .unwrap_or_else(|| written.clone());
-                let signature = format!("defimpl {}", args_text);
                 // `defimpl P, for: T` defines `P.T`, and `for: [A, B]` one
                 // module per type, each signed with its own `for:`; without
                 // `for:` it implements the protocol for the enclosing module.
@@ -613,7 +608,7 @@ impl<'s> Walker<'s> {
             }
             _ => (
                 DeclarationKind::Class,
-                vec![(written.clone(), format!("defmodule {}", written))],
+                vec![(written.clone(), signature)],
                 Vec::new(),
                 "module",
             ),
@@ -727,18 +722,7 @@ impl<'s> Walker<'s> {
         }
 
         let (private, modifier) = _def_traits(keyword);
-        // `defdelegate` keeps its `to:` target in the signature; every other
-        // macro shows only the head (the `do:` body is not signature).
-        let signature = if keyword == "defdelegate" {
-            let args_text = node
-                .children()
-                .find(|c| c.kind() == "arguments")
-                .map(|a| _code_text(&a))
-                .unwrap_or_default();
-            format!("{} {}", keyword, args_text)
-        } else {
-            format!("{} {}", keyword, _code_text(head))
-        };
+        let signature = _function_signature(node, keyword, head);
         let mut modifiers = Vec::new();
         if let Some(m) = modifier {
             modifiers.push(m);
@@ -1771,18 +1755,45 @@ fn _push_children<'a, D: Doc>(stack: &mut Vec<Node<'a, D>>, node: &Node<'a, D>) 
     stack[start..].reverse();
 }
 
-/// Whether `node` is a definition form: a module, or a `def`-family or
-/// def-like clause.
-fn _is_definition<'a, D: Doc>(node: &Node<'a, D>) -> bool {
+/// A definition form, as the search chunker sees it.
+pub(crate) enum Definition {
+    /// `defmodule` / `defprotocol` / `defimpl`.
+    Module { name: String, signature: String },
+    /// One clause of a `def`-family definition.
+    Function {
+        keyword: String,
+        name: String,
+        arity: usize,
+        signature: String,
+    },
+}
+
+/// Recognise `node` as a definition form, by the macro name of its target.
+pub(crate) fn definition<'a, D: Doc>(node: &Node<'a, D>) -> Option<Definition> {
     if node.kind() != "call" {
-        return false;
+        return None;
     }
-    let Some(keyword) = _call_keyword(node) else {
-        return false;
-    };
+    let keyword = _call_keyword(node)?;
+    let args = _named_args(node);
+    let first = args.first()?;
     match keyword.as_str() {
-        "defmodule" | "defprotocol" | "defimpl" => true,
-        k => DEF_MACROS.iter().any(|(kw, _, _)| *kw == k) || _is_def_like(node, k),
+        "defmodule" | "defprotocol" | "defimpl" => {
+            let written = _text(first);
+            Some(Definition::Module {
+                signature: _module_signature(node, &keyword, &written),
+                name: written,
+            })
+        }
+        k if DEF_MACROS.iter().any(|(kw, _, _)| *kw == k) || _is_def_like(node, k) => {
+            let (name, arity) = _head_name_arity(first);
+            Some(Definition::Function {
+                signature: _function_signature(node, &keyword, first),
+                keyword,
+                name,
+                arity,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -1810,8 +1821,8 @@ fn _string_content(literal: &str) -> String {
 
 /// The `do` and `else` blocks of a call that wraps definitions (`if … do def
 /// …`); empty when it wraps none.
-fn wrapped_bodies<'a, D: Doc>(node: &Node<'a, D>) -> Vec<Node<'a, D>> {
-    if node.kind() != "call" || _is_definition(node) {
+pub(crate) fn wrapped_bodies<'a, D: Doc>(node: &Node<'a, D>) -> Vec<Node<'a, D>> {
+    if node.kind() != "call" || definition(node).is_some() {
         return Vec::new();
     }
     let Some(block) = node.children().find(|c| c.kind() == "do_block") else {
@@ -1824,7 +1835,7 @@ fn wrapped_bodies<'a, D: Doc>(node: &Node<'a, D>) -> Vec<Node<'a, D>> {
     let bodies: Vec<_> = std::iter::once(block).chain(elses).collect();
     if bodies
         .iter()
-        .any(|b| b.children().any(|c| _is_definition(&c)))
+        .any(|b| b.children().any(|c| definition(&c).is_some()))
     {
         bodies
     } else {
@@ -1878,6 +1889,37 @@ fn _is_head<'a, D: Doc>(node: &Node<'a, D>) -> bool {
         }
         _ => false,
     }
+}
+
+/// `defmodule Foo`, `defprotocol P`, or `defimpl P, for: T` with its whole
+/// argument list.
+fn _module_signature<'a, D: Doc>(node: &Node<'a, D>, keyword: &str, written: &str) -> String {
+    if keyword == "defimpl" {
+        let args_text = node
+            .children()
+            .find(|c| c.kind() == "arguments")
+            .map(|a| _text(&a))
+            .unwrap_or_else(|| written.to_string());
+        return format!("defimpl {}", args_text);
+    }
+    format!("{} {}", keyword, written)
+}
+
+/// The keyword and head of a definition; `defdelegate` keeps its `to:`.
+fn _function_signature<'a, D: Doc>(
+    node: &Node<'a, D>,
+    keyword: &str,
+    head: &Node<'a, D>,
+) -> String {
+    if keyword == "defdelegate" {
+        let args_text = node
+            .children()
+            .find(|c| c.kind() == "arguments")
+            .map(|a| _code_text(&a))
+            .unwrap_or_default();
+        return format!("{} {}", keyword, args_text);
+    }
+    format!("{} {}", keyword, _code_text(head))
 }
 
 /// `__MODULE__.Foo` — a module named relative to the enclosing one.
