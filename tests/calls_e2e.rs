@@ -3994,6 +3994,56 @@ fn construction_project() -> tempfile::TempDir {
 }
 
 #[test]
+fn a_resolved_construction_counts_for_its_own_type_only() {
+  // `make` constructs `a::Foo` and `build` constructs `a.ts`'s `Bar`, each
+  // through its import. Another module's type of the same name is not
+  // constructed, though the names match.
+  let tmp = construction_project();
+  let root = tmp.path();
+  write(
+    &root.join("src/lib.rs"),
+    "pub mod a;\npub mod b;\npub mod c;\n",
+  );
+  write(&root.join("src/c.rs"), "pub struct Foo { pub y: u8 }\n");
+  write(&root.join("web/c.ts"), "export class Bar {}\n");
+  for (target, constructor) in [("src/a.rs:Foo", "make"), ("web/a.ts:Bar", "build")] {
+    let (out, code) = run_in(root, &["callers", target, ".", "--rebuild"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains(constructor), "{target}: {out}");
+  }
+  for target in ["src/c.rs:Foo", "web/c.ts:Bar"] {
+    let (out, code) = run_in(root, &["callers", target, "."]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("# 0 caller(s)"), "{target}: {out}");
+  }
+}
+
+#[test]
+fn a_construction_resolved_to_a_shared_function_qn_still_matches_by_name() {
+  // `B\Plain` is a class and a function of one qn. When a `new Plain()`
+  // resolves to that qn, it may have named the function, so it is not
+  // evidence of the class alone: it keeps the name match, as on `main`, and
+  // `A\Plain` still lists it.
+  let tmp = tempfile::tempdir().unwrap();
+  let root = tmp.path();
+  write(
+    &root.join("A/Foo.php"),
+    "<?php\nnamespace App\\A;\nclass Plain {}\n",
+  );
+  write(
+    &root.join("B/Foo.php"),
+    "<?php\nnamespace App\\B;\nclass Plain {}\nfunction Plain() {}\n",
+  );
+  write(
+    &root.join("use.php"),
+    "<?php\nuse App\\A\\Plain;\nfunction make() { return new Plain(); }\n",
+  );
+  let (out, code) = run_in(root, &["callers", "A/Foo.php:Plain", ".", "--rebuild"]);
+  assert_eq!(code, 0, "{out}");
+  assert!(out.contains("make"), "{out}");
+}
+
+#[test]
 fn incremental_update_keeps_constructions_of_types() {
   // Step 8 of `apply_delta_to_calls` checked `Resolved` targets against the
   // callables alone, so after any change it took every construction for one

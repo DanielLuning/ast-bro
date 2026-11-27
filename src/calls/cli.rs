@@ -391,9 +391,9 @@ pub(crate) fn collect_type_callers(calls: &CallGraph, type_qn: &Qn) -> TypeCalle
     .collect();
   implementations.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
 
-  // Constructions — call edges with kind == Construct whose bare callee
-  // name matches the type. Caller-side metadata (source qn, file, line)
-  // already lives on the edge.
+  // Constructions — call edges with kind == Construct that resolve to the
+  // type, or, unresolved, name it. Caller-side metadata (source qn, file,
+  // line) already lives on the edge.
   let mut constructions: Vec<CallEdge> = Vec::new();
   // A call from another language does not name an Elixir module, nor
   // an Elixir struct another language's type (`same_type_space`).
@@ -403,11 +403,21 @@ pub(crate) fn collect_type_callers(calls: &CallGraph, type_qn: &Qn) -> TypeCalle
         continue;
       }
       let target_name = match &e.target {
-        // An Elixir struct literal resolves to its module.
-        CallTarget::Resolved(qn) => match calls.types.get(qn) {
-          Some(meta) => type_key_of(qn, &meta.kind),
-          None => qn.name().to_string(),
-        },
+        // A construction resolved to a type constructs that type and no
+        // other of its name: a struct literal bound through an import, a
+        // TS `new`, an Elixir struct literal's module. A qn that is a
+        // function too (PHP `function Foo` beside `class Foo`) may have
+        // named the function, so it falls back to the name.
+        CallTarget::Resolved(qn)
+          if calls.types.contains_key(qn) && !calls.callable_meta.contains_key(qn) =>
+        {
+          if qn == type_qn {
+            constructions.push(e.clone());
+          }
+          continue;
+        }
+        // A constructor (Java, C#) is named after its type.
+        CallTarget::Resolved(qn) => qn.name().to_string(),
         CallTarget::External(s) | CallTarget::Bare(s) => trailing_segment(s),
       };
       if target_name == bare {

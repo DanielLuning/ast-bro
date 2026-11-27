@@ -9,7 +9,7 @@ Three subcommands — `callers`, `callees`, and `trace` — and a per-repo persi
 | Target kind | `callers X` | `callees X` |
 |---|---|---|
 | function / method / constructor | call sites where `X` is invoked (in-edges) | call sites inside `X`'s body (out-edges) |
-| class / struct / trait / interface / enum / record | downstream uses — implementors + constructions, including unit-struct receiver patterns (`Foo()`, `Foo::new()`, `Foo {}`, `new Foo()`) | upstream dependencies — ancestor types and the methods they declare, walked transitively via `--depth N` |
+| class / struct / trait / interface / enum / record | downstream uses — implementors + constructions, including unit-struct receiver patterns (`Foo()`, `Foo::new()`, `Foo {}`, `new Foo()`). A construction resolved to a type counts for that type only, not for another of its name; an unresolved one, or one resolved to a constructor or to a qn a function shares (PHP `function Foo` beside `class Foo`), matches by name | upstream dependencies — ancestor types and the methods they declare, walked transitively via `--depth N` |
 
 Both directions are inverses on their respective graphs. Diamond inheritance is handled. Ambiguous callers and unresolved/external callees are shown by default; `--hide-ambiguous` (callers) and `--hide-external` (callees) drop them. `callers` additionally scans for bare edges that *name* the target but were never attributed to a node (`traverse::unattributed_callers`) and lists them as possible callers — without this, a chain like `connection.getCtx().getPrefs().forDate()` whose receiver can't be typed would make `callers forDate` read `0` with nothing to suggest otherwise (issue #31).
 

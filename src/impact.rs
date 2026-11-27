@@ -683,8 +683,9 @@ fn build_callees_section(
   }
 }
 
-/// An edge into the type `c` itself: an Elixir struct literal, which the
-/// type's constructions (`collect_type_callers`) already count.
+/// An edge into the type `c` itself: a construction resolved to it (an
+/// imported Rust struct literal, a TS `new`, an Elixir struct literal),
+/// which the type's constructions (`collect_type_callers`) already count.
 fn constructs_type(c: &ResolvedTarget, e: &CallEdge) -> bool {
   c.kind == SymbolKind::Type && matches!(&e.target, CallTarget::Resolved(q) if *q == c.qn)
 }
