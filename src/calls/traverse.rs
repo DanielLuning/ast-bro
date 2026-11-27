@@ -282,10 +282,16 @@ pub fn unattributed_callers(graph: &CallGraph, targets: &[Qn]) -> Vec<CallEdge> 
       let CallTarget::Bare(name) = &e.target else {
         continue;
       };
+      let lang = crate::deps::resolver::Lang::from_path(&e.file);
+      // A Go literal is no call of a function: unresolved, it names one of
+      // its candidate types, whose constructions list it, or no project
+      // type at all.
+      if crate::calls::go::is_literal(lang, e.kind) {
+        continue;
+      }
       let hit = if e.candidates.is_empty() {
         // Only a target the call's language can reach (issue #96).
         names.contains(name.as_str()) && {
-          let lang = crate::deps::resolver::Lang::from_path(&e.file);
           targets
             .iter()
             .any(|t| t.name() == name && crate::calls::resolve::can_reach(lang, t))

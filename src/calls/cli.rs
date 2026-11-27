@@ -402,12 +402,22 @@ pub(crate) fn collect_type_callers(calls: &CallGraph, type_qn: &Qn) -> TypeCalle
       if !matches!(e.kind, CallKindCompat::Construct) || !same_type_space(&e.source, type_qn) {
         continue;
       }
+      // An unresolved Go literal was already looked up in its package: it
+      // names one of its candidate types, or none in the project.
+      let lang = crate::deps::resolver::Lang::from_path(&e.file);
+      if crate::calls::go::is_literal(lang, e.kind) && !matches!(e.target, CallTarget::Resolved(_))
+      {
+        if e.candidates.contains(type_qn) {
+          constructions.push(e.clone());
+        }
+        continue;
+      }
       let target_name = match &e.target {
         // A construction resolved to a type constructs that type and no
-        // other of its name: a struct literal bound through an import, a
-        // TS `new`, an Elixir struct literal's module. A qn that is a
-        // function too (PHP `function Foo` beside `class Foo`) may have
-        // named the function, so it falls back to the name.
+        // other of its name: a struct literal bound through an import or a
+        // Go package, a TS `new`, an Elixir struct literal's module. A qn
+        // that is a function too (PHP `function Foo` beside `class Foo`)
+        // may have named the function, so it falls back to the name.
         CallTarget::Resolved(qn)
           if calls.types.contains_key(qn) && !calls.callable_meta.contains_key(qn) =>
         {

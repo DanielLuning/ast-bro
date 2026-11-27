@@ -286,13 +286,30 @@ pub fn apply_delta_to_calls(calls: &mut CallGraph, deps: &DepGraph, root: &Path,
       if crate::calls::elixir::reresolve(e, tables) {
         continue;
       }
+      // A Go literal re-resolves by package from its type's name, as a
+      // delta can add, move or remove the type; see `calls::go`.
+      let lang = crate::deps::resolver::Lang::from_path(&e.file);
+      if crate::calls::go::is_literal(lang, e.kind) {
+        let name = e.target.name_or_raw();
+        (e.target, e.confidence, e.candidates) = crate::calls::go::resolve_literal(
+          root,
+          deps,
+          &root.join(&e.file),
+          &e.source,
+          e.receiver.as_deref(),
+          &name,
+          &calls.type_by_name,
+          &calls.callable_meta,
+        );
+        continue;
+      }
       let CallTarget::Bare(name) = &e.target else {
         continue;
       };
       // Pass B's language rule: only a function the caller's language
       // can call is a candidate (issue #96).
       let cands = crate::calls::resolve::reachable_from(
-        crate::deps::resolver::Lang::from_path(&e.file),
+        lang,
         calls.symbol_table.get(name).map_or(&[][..], Vec::as_slice),
       );
       if cands.is_empty() {

@@ -683,7 +683,7 @@ fn build_callees_section(
   }
 }
 
-/// An edge into the type `c` itself: a construction resolved to it (an
+/// An edge into the type `c` itself: a construction resolved to it (a Go or
 /// imported Rust struct literal, a TS `new`, an Elixir struct literal),
 /// which the type's constructions (`collect_type_callers`) already count.
 fn constructs_type(c: &ResolvedTarget, e: &CallEdge) -> bool {

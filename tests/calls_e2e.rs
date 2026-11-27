@@ -2693,6 +2693,503 @@ func pingTwice() {
 }
 
 #[test]
+fn go_callers_on_struct_returns_composite_literals() {
+  // Issue #131: `&Cart{}` is how Go constructs a `Cart`, and `callers Cart`
+  // and `impact Cart` reported nothing.
+  let tmp = tempfile::tempdir().unwrap();
+  let root = tmp.path();
+  write(&root.join("go.mod"), "module shop\n\ngo 1.21\n");
+  write(
+    &root.join("cart.go"),
+    "package shop\n\ntype Cart struct {\n\tItems []string\n}\n\nfunc NewCart() *Cart { return &Cart{} }\n",
+  );
+  write(
+    &root.join("checkout.go"),
+    "package shop\n\nfunc Checkout(c *Cart) int {\n\treturn len(c.Items)\n}\n",
+  );
+  // One literal is one caller: a construction, not also a call of a
+  // function named `Cart`.
+  let (out, code) = run_in(root, &["callers", "Cart", ".", "--rebuild"]);
+  assert_eq!(code, 0, "callers exited non-zero: {}", out);
+  assert!(out.starts_with("# 1 caller(s)"), "{}", out);
+  assert!(out.contains("1 construction(s) of struct Cart"), "{}", out);
+  assert!(out.contains("NewCart"), "{}", out);
+
+  // `Cart` is one symbol, a struct, and the literal names it exactly, so
+  // it survives `--hide-ambiguous`.
+  let (out, code) = run_in(
+    root,
+    &[
+      "impact",
+      "Cart",
+      ".",
+      "--hide-ambiguous",
+      "--json",
+      "--compact",
+    ],
+  );
+  assert_eq!(code, 0, "{}", out);
+  let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("valid json");
+  assert_eq!(doc["candidates"], 1, "{out}");
+  let impact = &doc["impacts"][0];
+  assert_eq!(impact["target_kind"], "struct", "{out}");
+  let callers: Vec<String> = impact["sections"]
+    .as_array()
+    .expect("sections")
+    .iter()
+    .filter(|s| s["title"].as_str().is_some_and(|t| t.contains("called by")))
+    .flat_map(|s| s["entries"].as_array().cloned().unwrap_or_default())
+    .filter_map(|e| e["qn"].as_str().map(str::to_string))
+    .collect();
+  assert_eq!(callers, vec!["cart.go::shop::NewCart"], "{out}");
+}
+
+#[test]
+fn go_composite_literal_of_a_named_type_is_a_construction() {
+  // A literal constructs the type it names: bare in its package, through
+  // the package's import name, or instantiated. A slice, array, map or
+  // anonymous struct literal constructs its untyped elements only.
+  let tmp = tempfile::tempdir().unwrap();
+  let root = tmp.path();
+  write(&root.join("go.mod"), "module shop\n\ngo 1.21\n");
+  write(
+    &root.join("model/model.go"),
+    "package model\n\ntype Item struct{ Name string }\n",
+  );
+  write(
+    &root.join("cart.go"),
+    r#"package shop
+
+import (
+	"net/http"
+
+	m "shop/model"
+)
+
+type Cart struct{ Items []m.Item }
+
+type Box[T any] struct{ V T }
+
+func (c Cart) Client() {}
+
+func Make() {
+	_ = Cart{}
+	_ = &Cart{Items: nil}
+	_ = m.Item{Name: "x"}
+	_ = Box[int]{V: 1}
+	_ = http.Client{}
+}
+
+func Collections() {
+	_ = []Cart{}
+	_ = map[string]Cart{}
+	_ = [2]int{1, 2}
+	_ = struct{ X int }{X: 1}
+}
+
+func Elided() {
+	_ = []Cart{{}, {Items: nil}}
+	_ = map[string]*Cart{"a": {}}
+	_ = [][]m.Item{{{Name: "x"}}}
+	_ = map[Cart]int{{}: 1}
+	_ = [...]Cart{0: {}}
+}
+"#,
+  );
+  let exact = |t: &str| (t.to_string(), "Exact".to_string());
+  assert_eq!(
+    callee_targets(root, "Make", true),
+    vec![
+      ("[unresolved] Client".to_string(), "Ambiguous".to_string()),
+      exact("cart.go::shop::Box"),
+      exact("cart.go::shop::Cart"),
+      exact("cart.go::shop::Cart"),
+      exact("model/model.go::model::Item"),
+    ]
+  );
+  assert_eq!(callee_targets(root, "Collections", false), vec![]);
+  // `http.Client{}` stays unresolved, and is no possible call of a method
+  // of that name.
+  let (out, code) = run_in(
+    root,
+    &["callers", "Cart.Client", ".", "--json", "--compact"],
+  );
+  assert_eq!(code, 0, "{out}");
+  let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("valid json");
+  assert_eq!(doc["unattributed_total"], 0, "{out}");
+  assert_eq!(
+    callee_targets(root, "Elided", false),
+    vec![
+      exact("cart.go::shop::Cart"),
+      exact("cart.go::shop::Cart"),
+      exact("cart.go::shop::Cart"),
+      exact("cart.go::shop::Cart"),
+      exact("cart.go::shop::Cart"),
+      exact("model/model.go::model::Item"),
+    ]
+  );
+}
+
+#[test]
+fn go_external_test_file_that_sorts_first_imports_its_directory() {
+  // An external test package imports its own directory. The dep graph
+  // points a Go import at one file of the directory; when the importing
+  // file sorts first, that file must not be itself, or the import is lost.
+  let tmp = tempfile::tempdir().unwrap();
+  let root = tmp.path();
+  write(&root.join("go.mod"), "module shop\n\ngo 1.21\n");
+  write(&root.join("a/a.go"), "package a\n\ntype Config struct{}\n");
+  write(
+    &root.join("a/0_ext_test.go"),
+    "package a_test\n\nimport \"shop/a\"\n\nfunc TestFirst() { _ = a.Config{} }\n",
+  );
+  write(
+    &root.join("a/00_dot_test.go"),
+    "package a_test\n\nimport . \"shop/a\"\n\nfunc TestFirstDot() { _ = Config{} }\n",
+  );
+  let exact = vec![("a/a.go::a::Config".to_string(), "Exact".to_string())];
+  assert_eq!(callee_targets(root, "TestFirst", true), exact);
+  assert_eq!(callee_targets(root, "TestFirstDot", false), exact);
+
+  // `deps` keeps the import too, which it dropped as a self-edge before.
+  let (out, code) = run_in(root, &["deps", "a/0_ext_test.go"]);
+  assert_eq!(code, 0, "{}", out);
+  assert!(
+    out.contains("(import)") && !out.contains("no imports"),
+    "{}",
+    out
+  );
+}
+
+#[test]
+fn go_composite_literal_constructs_its_own_package_type() {
+  // Two packages each declare a `Config`. A literal constructs the one in
+  // its package, or the one its qualifier imports, and `callers` of each
+  // lists its own constructions only.
+  let tmp = tempfile::tempdir().unwrap();
+  let root = tmp.path();
+  write(&root.join("go.mod"), "module shop\n\ngo 1.21\n");
+  write(
+    &root.join("a/a.go"),
+    "package a\n\ntype Config struct{}\n\nfunc NewA() Config { return Config{} }\n",
+  );
+  write(
+    &root.join("b/b.go"),
+    "package b\n\ntype Config struct{}\n\nfunc NewB() Config { return Config{} }\n",
+  );
+  write(
+    &root.join("main.go"),
+    "package main\n\nimport (\n\t\"shop/a\"\n\tbee \"shop/b\"\n)\n\nfunc UseA() { _ = a.Config{} }\n\nfunc UseB() { _ = bee.Config{} }\n",
+  );
+  let exact = |t: &str| vec![(t.to_string(), "Exact".to_string())];
+  assert_eq!(
+    callee_targets(root, "NewA", true),
+    exact("a/a.go::a::Config")
+  );
+  assert_eq!(
+    callee_targets(root, "NewB", false),
+    exact("b/b.go::b::Config")
+  );
+  assert_eq!(
+    callee_targets(root, "UseA", false),
+    exact("a/a.go::a::Config")
+  );
+  assert_eq!(
+    callee_targets(root, "UseB", false),
+    exact("b/b.go::b::Config")
+  );
+
+  // A dot import brings the package's types in bare.
+  write(
+    &root.join("dot/dot.go"),
+    "package dot\n\nimport . \"shop/a\"\n\nfunc Dot() { _ = Config{} }\n",
+  );
+  assert_eq!(
+    callee_targets(root, "Dot", false),
+    exact("a/a.go::a::Config")
+  );
+
+  // An external test package shares the directory and declares its own
+  // `Config`: a bare name there is its own, and an import of the directory
+  // names `a`, never `a_test`.
+  write(
+    &root.join("a/a_ext_test.go"),
+    "package a_test\n\nimport \"shop/a\"\n\ntype Config struct{}\n\nfunc TestOwn() { _ = Config{} }\n\nfunc TestImport() { _ = a.Config{} }\n",
+  );
+  assert_eq!(
+    callee_targets(root, "TestOwn", false),
+    exact("a/a_ext_test.go::a_test::Config")
+  );
+  for function in ["TestImport", "NewA", "UseA", "Dot"] {
+    assert_eq!(
+      callee_targets(root, function, false),
+      exact("a/a.go::a::Config"),
+      "{function}"
+    );
+  }
+
+  let (out, code) = run_in(root, &["callers", "a/a.go:Config", "."]);
+  assert_eq!(code, 0, "{}", out);
+  assert!(
+    out.contains("NewA") && out.contains("UseA") && out.contains("Dot"),
+    "{}",
+    out
+  );
+  assert!(!out.contains("NewB") && !out.contains("UseB"), "{}", out);
+  assert!(!out.contains("TestOwn"), "{}", out);
+}
+
+#[test]
+fn go_unresolved_composite_literal_constructs_only_its_candidates() {
+  // `http.Client{}` names no project type, so no `Client` lists it, in Go or
+  // in another language. `Cart{}` beside two build-tag declarations of `Cart`
+  // names one of them, so each lists it, and another package's `Cart` does
+  // not.
+  let tmp = tempfile::tempdir().unwrap();
+  let root = tmp.path();
+  write(&root.join("go.mod"), "module shop\n\ngo 1.21\n");
+  write(
+    &root.join("ext/ext.go"),
+    "package ext\n\nimport \"net/http\"\n\nfunc Ext() { _ = http.Client{} }\n",
+  );
+  write(
+    &root.join("a/a.go"),
+    "package a\n\ntype Client struct{}\n\ntype Cart struct{}\n",
+  );
+  write(&root.join("web/client.ts"), "export class Client {}\n");
+  write(
+    &root.join("tags/cart_linux.go"),
+    "//go:build linux\n\npackage tags\n\ntype Cart struct{}\n",
+  );
+  write(
+    &root.join("tags/cart_darwin.go"),
+    "//go:build darwin\n\npackage tags\n\ntype Cart struct{}\n",
+  );
+  write(
+    &root.join("tags/use.go"),
+    "package tags\n\nfunc Use() { _ = Cart{} }\n",
+  );
+  let lists = |target: &str, source: &str| {
+    let (out, code) = run_in(root, &["callers", target, ".", "--json", "--compact"]);
+    assert_eq!(code, 0, "{out}");
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("valid json");
+    doc["types"]
+      .as_array()
+      .expect("types array")
+      .iter()
+      .flat_map(|g| g["constructions"].as_array().cloned().unwrap_or_default())
+      .any(|c| c["source"].as_str().is_some_and(|s| s.ends_with(source)))
+  };
+  run_in(root, &["callers", "Client", ".", "--rebuild"]);
+  assert!(!lists("a/a.go:Client", "::Ext"), "Go type");
+  assert!(!lists("web/client.ts:Client", "::Ext"), "TS type");
+  assert!(lists("tags/cart_linux.go:Cart", "::Use"), "candidate");
+  assert!(lists("tags/cart_darwin.go:Cart", "::Use"), "candidate");
+  assert!(!lists("a/a.go:Cart", "::Use"), "another package");
+}
+
+#[test]
+fn go_composite_literal_never_binds_to_a_function_of_its_name() {
+  // A getter often shares its type's name (`func (d *DB) Message() Message`).
+  // A literal names a type, so `Message{}` binds to the type, never to the
+  // method: in the method's file, elsewhere in its package, through the
+  // package name, and after an incremental update.
+  let tmp = tempfile::tempdir().unwrap();
+  let root = tmp.path();
+  write(&root.join("go.mod"), "module shop\n\ngo 1.21\n");
+  write(
+    &root.join("database/models.go"),
+    "package database\n\ntype Message struct{ ID int }\n\nfunc Other() Message { return Message{} }\n",
+  );
+  write(
+    &root.join("database/messages.go"),
+    "package database\n\ntype DB struct{}\n\nfunc (d *DB) Message() Message { return Message{ID: 1} }\n\nfunc Local() Message { return Message{} }\n",
+  );
+  write(
+    &root.join("web/web.go"),
+    "package web\n\nimport \"shop/database\"\n\nfunc Show() database.Message { return database.Message{} }\n",
+  );
+  let message = vec![(
+    "database/models.go::database::Message".to_string(),
+    "Exact".to_string(),
+  )];
+  assert_eq!(callee_targets(root, "Local", true), message, "same file");
+  assert_eq!(
+    callee_targets(root, "Other", false),
+    message,
+    "same package"
+  );
+  assert_eq!(callee_targets(root, "Show", false), message, "qualified");
+
+  // Nor is a literal a possible call of the method: nothing calls it.
+  let (out, code) = run_in(root, &["callers", "DB.Message", ".", "--json", "--compact"]);
+  assert_eq!(code, 0, "{out}");
+  let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("valid json");
+  assert_eq!(doc["total"], 0, "{out}");
+  assert_eq!(doc["unattributed_total"], 0, "{out}");
+
+  write(
+    &root.join("database/messages.go"),
+    "package database\n\ntype DB struct{}\n\nfunc (d *DB) Message() Message { return Message{ID: 2} }\n\nfunc Local() Message { return Message{} }\n",
+  );
+  assert_eq!(
+    callee_targets(root, "Local", false),
+    message,
+    "after an edit"
+  );
+  assert_eq!(
+    callee_targets(root, "Other", false),
+    message,
+    "after an edit"
+  );
+  assert_eq!(
+    callee_targets(root, "Show", false),
+    message,
+    "after an edit"
+  );
+}
+
+#[test]
+fn go_composite_literal_is_no_call_of_a_getter_of_the_same_qn() {
+  // A method whose receiver type is declared in another file sits at
+  // package level, so `(d *DB) Message()` in message.go has the qn of the
+  // type `Message` declared beside it. The literal in `Build` constructs
+  // the type; only `Use` calls the getter.
+  let tmp = tempfile::tempdir().unwrap();
+  let root = tmp.path();
+  write(&root.join("go.mod"), "module shop\n\ngo 1.21\n");
+  write(
+    &root.join("store/db.go"),
+    "package store\n\ntype DB struct{}\n",
+  );
+  write(
+    &root.join("store/message.go"),
+    "package store\n\ntype Message struct{ ID int }\n\nfunc (d *DB) Message() Message { return Message{} }\n\nfunc Build() Message { return Message{ID: 1} }\n\nfunc Use(d *DB) { d.Message() }\n",
+  );
+  let (out, code) = run_in(
+    root,
+    &[
+      "callers",
+      "store/message.go:Message",
+      ".",
+      "--rebuild",
+      "--json",
+      "--compact",
+    ],
+  );
+  assert_eq!(code, 0, "{out}");
+  let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("valid json");
+  let sources = |rows: &serde_json::Value| -> Vec<String> {
+    let mut v: Vec<String> = rows
+      .as_array()
+      .into_iter()
+      .flatten()
+      .filter_map(|r| {
+        r["source"]
+          .as_str()
+          .map(|s| s.rsplit("::").next().unwrap().to_string())
+      })
+      .collect();
+    v.sort();
+    v
+  };
+  assert_eq!(
+    sources(&doc["matches"]),
+    vec!["Use"],
+    "calls of the getter: {out}"
+  );
+  assert_eq!(
+    sources(&doc["types"][0]["constructions"]),
+    vec!["Build", "Message"],
+    "constructions of the type: {out}"
+  );
+
+  let (out, code) = run_in(root, &["impact", "store/message.go:Message", "."]);
+  assert_eq!(code, 0, "{out}");
+  let getter = out
+    .split("⊕ ")
+    .find(|r| r.starts_with("method"))
+    .unwrap_or_default();
+  assert!(
+    getter.contains("Use") && !getter.contains("Build"),
+    "impact: {out}"
+  );
+
+  // Nor is the literal a hop of a call path from `Build` to the getter.
+  let (out, code) = run_in(root, &["trace", "Build", "store/message.go:Message", "."]);
+  assert_eq!(code, 0, "{out}");
+  assert!(out.contains("no static call path found"), "trace: {out}");
+
+  // The literal keeps the type as its one candidate, as the qn alone would
+  // name the method, and `context` does not inline the getter for it.
+  assert_eq!(
+    callee_targets(root, "Build", false),
+    vec![("[unresolved] Message".to_string(), "Ambiguous".to_string())]
+  );
+  let (out, code) = run_in(root, &["context", "Build", "."]);
+  assert_eq!(code, 0, "{out}");
+  assert!(!out.contains("func (d *DB) Message()"), "context: {out}");
+
+  // Without the getter, the qn names the type alone, after an update too.
+  write(
+    &root.join("store/message.go"),
+    "package store\n\ntype Message struct{ ID int }\n\nfunc Build() Message { return Message{ID: 1} }\n",
+  );
+  assert_eq!(
+    callee_targets(root, "Build", false),
+    vec![(
+      "store/message.go::store::Message".to_string(),
+      "Exact".to_string()
+    )]
+  );
+}
+
+#[test]
+fn go_composite_literal_follows_its_type_through_incremental_updates() {
+  // A type that moves, disappears and comes back takes its constructions
+  // with it, in files that did not change, as a cold build would.
+  let tmp = tempfile::tempdir().unwrap();
+  let root = tmp.path();
+  write(&root.join("go.mod"), "module shop\n\ngo 1.21\n");
+  write(
+    &root.join("cart.go"),
+    "package shop\n\ntype Cart struct{}\n",
+  );
+  write(
+    &root.join("use.go"),
+    "package shop\n\nfunc Make() Cart { return Cart{} }\n",
+  );
+  let target = |t: &str, c: &str| vec![(t.to_string(), c.to_string())];
+  assert_eq!(
+    callee_targets(root, "Make", true),
+    target("cart.go::shop::Cart", "Exact")
+  );
+
+  std::fs::remove_file(root.join("cart.go")).unwrap();
+  write(
+    &root.join("types.go"),
+    "package shop\n\ntype Cart struct{}\n",
+  );
+  assert_eq!(
+    callee_targets(root, "Make", false),
+    target("types.go::shop::Cart", "Exact"),
+    "after a move"
+  );
+  assert_eq!(
+    callee_targets(root, "Make", true),
+    target("types.go::shop::Cart", "Exact"),
+    "a cold build of the same content"
+  );
+
+  std::fs::remove_file(root.join("types.go")).unwrap();
+  assert_eq!(
+    callee_targets(root, "Make", false),
+    target("[unresolved] Cart", "Ambiguous"),
+    "after a delete"
+  );
+}
+
+#[test]
 fn php_callers_finds_intra_file_caller() {
   // Single-file PHP: pingTwice() invokes helper() and $g->greet().
   // Pass A promotes both bare names to same-file qns.
@@ -4041,6 +4538,35 @@ fn a_construction_resolved_to_a_shared_function_qn_still_matches_by_name() {
   let (out, code) = run_in(root, &["callers", "A/Foo.php:Plain", ".", "--rebuild"]);
   assert_eq!(code, 0, "{out}");
   assert!(out.contains("make"), "{out}");
+}
+
+#[test]
+fn an_import_bound_rust_tuple_struct_keeps_its_callers() {
+  // `TFoo(3)` is a call resolved to the type through the import. It reaches
+  // `callers`, `impact` and `trace` through the function side, which stays
+  // open for a Rust type (only a Go or Elixir literal's type is a type
+  // alone).
+  let tmp = tempfile::tempdir().unwrap();
+  let root = tmp.path();
+  write(
+    &root.join("Cargo.toml"),
+    "[package]\nname=\"x\"\nversion=\"0.0.0\"\nedition=\"2021\"\n",
+  );
+  write(&root.join("src/lib.rs"), "pub mod a;\npub mod b;\n");
+  write(&root.join("src/a.rs"), "pub struct TFoo(pub i32);\n");
+  write(
+    &root.join("src/b.rs"),
+    "use crate::a::TFoo;\npub fn other2() -> TFoo { TFoo(3) }\n",
+  );
+  let (out, code) = run_in(root, &["callers", "TFoo", ".", "--rebuild"]);
+  assert_eq!(code, 0, "{out}");
+  assert!(out.contains("other2"), "callers: {out}");
+  let (out, code) = run_in(root, &["impact", "TFoo", "."]);
+  assert_eq!(code, 0, "{out}");
+  assert!(out.contains("other2"), "impact: {out}");
+  let (out, code) = run_in(root, &["trace", "other2", "TFoo", "."]);
+  assert_eq!(code, 0, "trace: {out}");
+  assert!(out.contains("(1 hop)"), "trace: {out}");
 }
 
 #[test]

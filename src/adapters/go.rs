@@ -889,10 +889,108 @@ fn _walk_calls_in_body<'a, D: Doc>(node: &Node<'a, D>, src: &[u8], out: &mut Vec
     if let Some(cs) = _call_site_from_call_go(node, src) {
       out.push(cs);
     }
+  } else if kind == "composite_literal" {
+    _call_sites_from_composite_go(node, src, out);
   }
 
   for child in node.children() {
     _walk_calls_in_body(&child, src, out);
+  }
+}
+
+/// `Cart{}`, `shop.Cart{}` and `Box[int]{}` construct the type they name. A
+/// slice, array or map literal constructs its elements whose type it elides:
+/// each `{…}` in `[]Cart{{…}, {…}}` or `map[string]*Cart{"a": {…}}` is a
+/// `Cart`. An anonymous struct literal names no declared type.
+fn _call_sites_from_composite_go<'a, D: Doc>(
+  node: &Node<'a, D>,
+  src: &[u8],
+  out: &mut Vec<CallSite>,
+) {
+  let Some(ty) = node.field("type") else {
+    return;
+  };
+  if let Some((name, receiver)) = _named_type_go(&ty, src) {
+    out.push(_construct_go(name, receiver, node));
+  } else if let Some(body) = node.field("body") {
+    _elided_constructs_go(&ty, &body, src, out);
+  }
+}
+
+/// The constructions `body`, a literal of the collection type `ty`, elides.
+fn _elided_constructs_go<'a, D: Doc>(
+  ty: &Node<'a, D>,
+  body: &Node<'a, D>,
+  src: &[u8],
+  out: &mut Vec<CallSite>,
+) {
+  let (key, element) = match ty.kind().as_ref() {
+    "slice_type" | "array_type" | "implicit_length_array_type" => (None, ty.field("element")),
+    "map_type" => (ty.field("key"), ty.field("value")),
+    _ => return,
+  };
+  let mut elided = |value: Option<Node<'a, D>>, ty: Option<&Node<'a, D>>| {
+    let (Some(value), Some(ty)) = (value, ty) else {
+      return;
+    };
+    // An element is a `literal_element` holding an expression or, when its
+    // type is elided, a `literal_value`.
+    let Some(literal) = value.children().find(|c| c.kind() == "literal_value") else {
+      return;
+    };
+    let ty = if ty.kind().as_ref() == "pointer_type" {
+      let inner = ty.children().find(|c| c.is_named());
+      match inner {
+        Some(inner) => inner,
+        None => return,
+      }
+    } else {
+      ty.clone()
+    };
+    match _named_type_go(&ty, src) {
+      Some((name, receiver)) => out.push(_construct_go(name, receiver, &literal)),
+      None => _elided_constructs_go(&ty, &literal, src, out),
+    }
+  };
+  for child in body.children() {
+    match child.kind().as_ref() {
+      "literal_element" => elided(Some(child.clone()), element.as_ref()),
+      // A slice or array key is an index, not an element.
+      "keyed_element" => {
+        if key.is_some() {
+          elided(child.field("key"), key.as_ref());
+        }
+        elided(child.field("value"), element.as_ref());
+      }
+      _ => {}
+    }
+  }
+}
+
+/// The type a literal names, and the package qualifying it, when it is a
+/// declared type: `Cart`, `shop.Cart`, `Box[int]`.
+fn _named_type_go<'a, D: Doc>(ty: &Node<'a, D>, src: &[u8]) -> Option<(String, Option<String>)> {
+  let mut ty = ty.clone();
+  if ty.kind().as_ref() == "generic_type" {
+    ty = ty.field("type")?;
+  }
+  let text = |n: &Node<'a, D>| String::from_utf8_lossy(&src[n.range()]).to_string();
+  match ty.kind().as_ref() {
+    "type_identifier" => Some((text(&ty), None)),
+    "qualified_type" => Some((text(&ty.field("name")?), Some(text(&ty.field("package")?)))),
+    _ => None,
+  }
+}
+
+fn _construct_go<'a, D: Doc>(name: String, receiver: Option<String>, at: &Node<'a, D>) -> CallSite {
+  CallSite {
+    name,
+    receiver,
+    line: at.start_pos().line() as u32 + 1,
+    kind: CallKind::Construct,
+    receiver_scope: ReceiverScope::None,
+    imports: Vec::new(),
+    arity: None,
   }
 }
 

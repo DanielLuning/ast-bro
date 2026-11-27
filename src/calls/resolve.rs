@@ -172,6 +172,29 @@ pub fn run_with_table(
         continue;
       }
 
+      // A Go literal names a type, by package; see `calls::go`.
+      if crate::calls::go::is_literal(lang, raw.kind) {
+        let (target, confidence, candidates) = crate::calls::go::resolve_literal(
+          root,
+          deps,
+          &fp.file,
+          &raw.source,
+          raw.receiver.as_deref(),
+          &raw.bare_name,
+          type_by_name,
+          callable_meta,
+        );
+        let edge = raw_to_edge(
+          raw,
+          target,
+          confidence,
+          rel_path(root, &fp.file),
+          candidates,
+        );
+        forward.entry(edge.source.clone()).or_default().push(edge);
+        continue;
+      }
+
       // An explicit receiver disqualifies same-file binding: a local
       // homonym must not shadow `connection.getCtx()` — the receiver
       // says the target lives on another object (issue #31). Self-like

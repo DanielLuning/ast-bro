@@ -14,7 +14,8 @@ pub enum SymbolKind {
   /// qn is a function/method/constructor — present in `forward`/`reverse`.
   Callable,
   /// qn is a class/struct/trait/interface/enum/record — present in
-  /// `types` / `type_by_name` but not in the call edges.
+  /// `types` / `type_by_name`, and in the call edges only as the target of
+  /// a construction or call resolved to it.
   Type,
 }
 
@@ -64,13 +65,17 @@ fn resolve_in(calls: &CallGraph, file_filter: Option<&str>, symbol: &str) -> Vec
   // inside a dotted one: `Shop.Money` names `Shop.Money` in full, and only
   // ends `Inspect.Shop.Money`.
   let mut matches: Vec<(ResolvedTarget, bool)> = Vec::new();
-  // An Elixir struct literal's edge targets its module, which is a type.
-  // Elsewhere a function and a type may share a qn (PHP `function Foo`
-  // beside `class Foo`), and both are matched.
-  for qn in collect_callable_qns(calls)
-    .into_iter()
-    .filter(|q| !(calls.types.contains_key(q) && qn_lang(q) == Some(Lang::Elixir)))
-  {
+  // A Go or Elixir struct literal's edge targets its type, which stays a
+  // type: the type's constructions list the literal. (An import-bound Rust
+  // literal, a tuple-struct call or a TS `new` also targets its type, and
+  // `context`, `trace` and `--depth` still reach those through the
+  // function side.) A function and a type may share a qn (PHP `function
+  // Foo` beside `class Foo`), and then both are matched.
+  for qn in collect_callable_qns(calls).into_iter().filter(|q| {
+    !(calls.types.contains_key(q)
+      && !calls.callable_meta.contains_key(q)
+      && matches!(qn_lang(q), Some(Lang::Elixir | Lang::Go)))
+  }) {
     if let Some(filter) = file_filter {
       if !file_matches(&qn, filter) {
         continue;

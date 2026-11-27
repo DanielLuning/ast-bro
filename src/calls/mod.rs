@@ -25,6 +25,7 @@ pub mod build;
 pub mod cli;
 pub mod cli_helpers;
 pub mod elixir;
+pub mod go;
 pub mod graph;
 pub mod mcp;
 pub mod pass;
