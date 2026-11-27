@@ -31,65 +31,57 @@ pub fn run_callers_text(
   include_ambiguous: bool,
   json: bool,
 ) -> Result<String, String> {
-  use crate::calls::{render, traverse};
+  use crate::calls::render;
 
   let promoted = load_calls_graph(root)?;
   let calls = promoted
     .calls
     .as_ref()
     .ok_or_else(|| "call graph unavailable".to_string())?;
-  let qns = crate::calls::cli_helpers::resolve_target_qns(calls, target);
-  let mut hits = Vec::new();
-  let mut frontier_truncated = false;
-  for qn in &qns {
-    // Walk unbounded so the header carries the true total; `--limit`
-    // trims the display (issue #32). Filter inside the traversal so
-    // dropped ambiguous edges don't consume the limit.
-    let info = traverse::callers_info(calls, qn, depth.max(1), crate::UNLIMITED, |e| {
-      include_ambiguous || !matches!(e.confidence, crate::calls::graph::Confidence::Ambiguous)
+  // Functions and types both, through the CLI's own answer: a type's
+  // implementations and constructions are callers too.
+  let candidates = crate::calls::cli_helpers::resolve_target_full(calls, target);
+  let answer =
+    crate::calls::cli::gather_callers(calls, &candidates, depth, limit, include_ambiguous, &|_| {
+      true
     });
-    frontier_truncated |= info.frontier_truncated;
-    hits.extend(info.hits);
-  }
-  let total = hits.len();
-  if hits.len() > limit {
-    hits.truncate(limit);
-  }
-  // Same unattributed-edge policy as the CLI path (issue #31), through
-  // the one shared constructor so the two surfaces cannot drift. MCP has
-  // no stderr channel, so when `include_ambiguous` is off the hidden
-  // count is prepended to the response text instead of printed as a note
-  // — silently dropping it would make "0 callers" read as authoritative.
-  let facts = render::UnattributedFacts::collect(calls, &qns, include_ambiguous, limit, &|_| true);
-  let hidden_note = facts
+  // MCP has no stderr channel, so when `include_ambiguous` is off the
+  // hidden count is prepended to the response text instead of printed as
+  // a note — silently dropping it would make "0 callers" read as
+  // authoritative.
+  let hidden_note = answer
+    .unattributed
     .hidden_note(target, "include_ambiguous: false")
     .map(|n| format!("{n}\n"))
     .unwrap_or_default();
-  let unattributed = facts.view();
-  let trunc = render::Truncation {
-    total,
-    frontier_truncated,
-  };
+  let unattributed = answer.unattributed.view();
   if json {
-    Ok(render::render_callers_json(
+    Ok(render::render_callers_json_extended(
       target,
       depth.max(1),
-      &hits,
+      &answer.hits,
+      &answer.type_groups,
       &unattributed,
-      &trunc,
+      &answer.trunc,
       true,
     ))
   } else {
     // Same note as the CLI's stderr line, through the same helper so the
     // two can't drift. MCP's one channel is the response text.
-    let frontier_note = render::frontier_note(depth, frontier_truncated)
+    let frontier_note = render::frontier_note(depth, answer.trunc.frontier_truncated)
       .map(|n| format!("{n}\n"))
       .unwrap_or_default();
     Ok(format!(
       "{}{}{}",
       frontier_note,
       hidden_note,
-      render::render_callers_text(target, &hits, &unattributed, &trunc)
+      render::render_callers_text_extended(
+        target,
+        &answer.hits,
+        &answer.type_groups,
+        &unattributed,
+        &answer.trunc,
+      )
     ))
   }
 }

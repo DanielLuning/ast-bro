@@ -759,3 +759,45 @@ fn mcp_callers_ignores_a_rebuild_key() {
     "callers with and without `rebuild`"
   );
 }
+
+/// An Elixir struct literal resolves to its module, a type, and MCP lists
+/// it as a construction of that type, as the CLI does.
+#[test]
+fn mcp_callers_of_an_elixir_struct_lists_its_literals() {
+  let tmp = tempfile::tempdir().unwrap();
+  std::fs::write(
+    tmp.path().join("shop.ex"),
+    "defmodule Shop.Item do\n  defstruct [:n]\nend\n\ndefmodule Shop.Make do\n  def make, do: %Shop.Item{n: 1}\nend\n",
+  )
+  .unwrap();
+  let resp = call_tool(
+    tmp.path(),
+    "callers",
+    serde_json::json!({"target": "Shop.Item"}),
+  );
+  let (_, is_error, text) = result_of(&resp);
+  assert!(!is_error, "{resp}");
+  assert!(text.starts_with("# 1 caller(s)"), "{text}");
+  assert!(text.contains("construction(s)"), "{text}");
+  assert!(text.contains("make"), "{text}");
+}
+
+/// A trait's implementations are its callers on MCP too, as on the CLI.
+#[test]
+fn mcp_callers_of_a_trait_lists_its_implementations() {
+  let tmp = tempfile::tempdir().unwrap();
+  std::fs::write(
+    tmp.path().join("lib.rs"),
+    "pub trait Shape {}\n\npub struct Square;\n\nimpl Shape for Square {}\n",
+  )
+  .unwrap();
+  let resp = call_tool(
+    tmp.path(),
+    "callers",
+    serde_json::json!({"target": "Shape"}),
+  );
+  let (_, is_error, text) = result_of(&resp);
+  assert!(!is_error, "{resp}");
+  assert!(text.contains("implementation(s)"), "{text}");
+  assert!(text.contains("Square"), "{text}");
+}

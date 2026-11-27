@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::calls::cli_helpers::{resolve_target_full, SymbolKind};
+use crate::calls::cli_helpers::{resolve_target_full, ResolvedTarget, SymbolKind};
 use crate::calls::graph::{
   same_type_space, type_key, type_key_of, CallEdge, CallGraph, CallKindCompat, CallTarget,
   Confidence, Qn,
@@ -46,55 +46,99 @@ pub fn run_callers(
     return crate::cli_error::symbol_not_found("callers", target, json);
   }
 
+  // `--tests` / `--exclude-tests` narrow the query itself, every section
+  // alike; all of them carry repo-relative file paths.
+  let keep = |file: &Path| {
+    if !(tests || exclude_tests) {
+      return true;
+    }
+    let is_test = crate::file_filter::is_test_file(&root.join(file), &root);
+    if exclude_tests {
+      !is_test
+    } else {
+      is_test
+    }
+  };
+  let answer = gather_callers(calls, &candidates, depth, limit, include_ambiguous, &keep);
+  if let Some(note) = render::frontier_note(depth, answer.trunc.frontier_truncated) {
+    eprintln!("{}", note);
+  }
+  if let Some(note) = answer.unattributed.hidden_note(target, "--hide-ambiguous") {
+    eprintln!("{note}");
+  }
+  let unattributed = answer.unattributed.view();
+
+  if json {
+    println!(
+      "{}",
+      render::render_callers_json_extended(
+        target,
+        depth.max(1),
+        &answer.hits,
+        &answer.type_groups,
+        &unattributed,
+        &answer.trunc,
+        pretty,
+      )
+    );
+  } else {
+    print!(
+      "{}",
+      render::render_callers_text_extended(
+        target,
+        &answer.hits,
+        &answer.type_groups,
+        &unattributed,
+        &answer.trunc,
+      )
+    );
+  }
+  0
+}
+
+/// Everything `callers` answers for the resolved `candidates`, before
+/// rendering. The CLI and the MCP tool both build their answer here, so
+/// neither surface can drop a section the other shows; each decides only
+/// how to deliver the notes (stderr or the response text) and which files
+/// to `keep` (the CLI's `--tests` / `--exclude-tests`).
+pub(crate) struct CallersAnswer {
+  pub hits: Vec<traverse::CallHit>,
+  pub type_groups: Vec<TypeCallersGroup>,
+  pub unattributed: render::UnattributedFacts,
+  pub trunc: render::Truncation,
+}
+
+pub(crate) fn gather_callers(
+  calls: &CallGraph,
+  candidates: &[ResolvedTarget],
+  depth: usize,
+  limit: usize,
+  include_ambiguous: bool,
+  keep: &dyn Fn(&Path) -> bool,
+) -> CallersAnswer {
   let mut hits = Vec::new();
   let mut frontier_truncated = false;
   let mut type_groups: Vec<TypeCallersGroup> = Vec::new();
-  for c in &candidates {
+  for c in candidates {
     match c.kind {
       SymbolKind::Callable => {
         // Walk unbounded so the header can report the true total;
         // `--limit` trims the *display* below (issue #32).
         let info = traverse::callers_info(calls, &c.qn, depth.max(1), UNLIMITED, |edge| {
-          if !include_ambiguous && matches!(edge.confidence, Confidence::Ambiguous) {
-            return false;
-          }
-          if tests || exclude_tests {
-            let is_test = crate::file_filter::is_test_file(&root.join(&edge.file), &root);
-            if exclude_tests {
-              if is_test {
-                return false;
-              }
-            } else if !is_test {
-              return false;
-            }
-          }
-          true
+          (include_ambiguous || !matches!(edge.confidence, Confidence::Ambiguous))
+            && keep(&edge.file)
         });
         frontier_truncated |= info.frontier_truncated;
         hits.extend(info.hits);
       }
       SymbolKind::Type => {
         let mut group = collect_type_callers(calls, &c.qn);
-        // Same --tests / --exclude-tests semantics as the callable
-        // hits above — implementations and constructions both
-        // carry repo-relative file paths.
-        if tests || exclude_tests {
-          let keep = |file: &Path| {
-            let is_test = crate::file_filter::is_test_file(&root.join(file), &root);
-            if exclude_tests {
-              !is_test
-            } else {
-              is_test
-            }
-          };
-          group.implementations.retain(|i| keep(&i.file));
-          group.constructions.retain(|e| keep(&e.file));
-          // The filter narrows the query itself; totals report
-          // the post-filter truth (display truncation below
-          // leaves them untouched).
-          group.implementations_total = group.implementations.len();
-          group.constructions_total = group.constructions.len();
-        }
+        group.implementations.retain(|i| keep(&i.file));
+        group.constructions.retain(|e| keep(&e.file));
+        // Totals report the post-filter truth (display truncation below
+        // leaves them untouched).
+        group.implementations_total = group.implementations.len();
+        group.constructions_total = group.constructions.len();
         type_groups.push(group);
       }
     }
@@ -124,9 +168,6 @@ pub fn run_callers(
     }
     remaining -= g.constructions.len();
   }
-  if let Some(note) = render::frontier_note(depth, frontier_truncated) {
-    eprintln!("{}", note);
-  }
 
   // Bare edges naming the target never enter the reverse index, so the
   // BFS above cannot count them. Surface them (or say they were hidden)
@@ -136,47 +177,20 @@ pub fn run_callers(
     .filter(|c| matches!(c.kind, SymbolKind::Callable))
     .map(|c| c.qn.clone())
     .collect();
-  let facts =
+  let unattributed =
     render::UnattributedFacts::collect(calls, &callable_qns, include_ambiguous, limit, &|e| {
-      if !(tests || exclude_tests) {
-        return true;
-      }
-      let is_test = crate::file_filter::is_test_file(&root.join(&e.file), &root);
-      if exclude_tests {
-        !is_test
-      } else {
-        is_test
-      }
+      keep(&e.file)
     });
-  if let Some(note) = facts.hidden_note(target, "--hide-ambiguous") {
-    eprintln!("{note}");
-  }
-  let unattributed = facts.view();
 
-  let trunc = render::Truncation {
-    total,
-    frontier_truncated,
-  };
-  if json {
-    println!(
-      "{}",
-      render::render_callers_json_extended(
-        target,
-        depth.max(1),
-        &hits,
-        &type_groups,
-        &unattributed,
-        &trunc,
-        pretty,
-      )
-    );
-  } else {
-    print!(
-      "{}",
-      render::render_callers_text_extended(target, &hits, &type_groups, &unattributed, &trunc,)
-    );
+  CallersAnswer {
+    hits,
+    type_groups,
+    unattributed,
+    trunc: render::Truncation {
+      total,
+      frontier_truncated,
+    },
   }
-  0
 }
 
 /// Display cap for the unresolved-call-site section. Small on purpose: the

@@ -70,6 +70,7 @@ callers <Sym>:                              # kind-aware:
   if callable: reverse traversal of `forward`
                + unattributed bare edges naming <Sym>
   if type:     implementors ∪ constructions
+  (one `cli::gather_callers` answer for the CLI and the MCP tool)
 
 callees <Sym>:                              # kind-aware:
   if callable: forward traversal of `forward`

@@ -173,27 +173,6 @@ impl UnattributedFacts {
   }
 }
 
-pub fn render_callers_text(
-  target: &str,
-  hits: &[CallHit],
-  unattributed: &Unattributed<'_>,
-  trunc: &Truncation,
-) -> String {
-  let mut out = String::new();
-  out.push_str(&header_line_suffixed(
-    "caller",
-    trunc.total,
-    target,
-    &trunc.header_suffix(hits.len()),
-  ));
-  for h in hits {
-    out.push_str(&format_caller_line(h));
-    out.push('\n');
-  }
-  out.push_str(&unattributed_section(target, unattributed));
-  out
-}
-
 /// Call sites the resolver could not attribute (bare/ambiguous edges naming
 /// the target). Rendered below the resolved hits so a caller count is never
 /// silently low (issue #31), with its own display cap independent of
@@ -265,10 +244,9 @@ fn terminal_name(target: &str) -> &str {
   target.rsplit(['.', ':']).next().unwrap_or(target)
 }
 
-/// Like `render_callers_text` but interleaves type-aware groups
-/// (implementations + constructions) below the call-edge hits. Used when
-/// the same target name resolves both as a callable and as a type, or when
-/// it's purely a type.
+/// Text renderer for `callers`: the call-edge hits, then the type-aware
+/// groups (implementations + constructions) of each type the target names,
+/// then the unattributed call sites.
 pub fn render_callers_text_extended(
   target: &str,
   hits: &[CallHit],
@@ -730,46 +708,6 @@ pub fn render_callers_json_extended(
       "frontier_truncated": trunc.frontier_truncated,
       "matches": matches,
       "types": type_views,
-  });
-  for (k, v) in json_unattributed_fields(unattributed) {
-    doc[k] = v;
-  }
-  if pretty {
-    serde_json::to_string_pretty(&doc).unwrap_or_default()
-  } else {
-    serde_json::to_string(&doc).unwrap_or_default()
-  }
-}
-
-pub fn render_callers_json(
-  target: &str,
-  depth: usize,
-  hits: &[CallHit],
-  unattributed: &Unattributed<'_>,
-  trunc: &Truncation,
-  pretty: bool,
-) -> String {
-  let matches: Vec<JsonCaller> = hits
-    .iter()
-    .map(|h| JsonCaller {
-      source: h.edge.source.to_string(),
-      target: h.edge.target.display(),
-      kind: h.edge.kind.as_str(),
-      file: file_str(&h.edge.file),
-      line: h.edge.line,
-      depth: h.depth,
-      confidence: h.edge.confidence.as_str(),
-      candidates: h.edge.candidates.iter().collect(),
-    })
-    .collect();
-  let mut doc = json!({
-      "schema": JSON_SCHEMA_CALLERS,
-      "target": target,
-      "depth": depth,
-      "total": trunc.total,
-      "truncated": trunc.total > hits.len(),
-      "frontier_truncated": trunc.frontier_truncated,
-      "matches": matches,
   });
   for (k, v) in json_unattributed_fields(unattributed) {
     doc[k] = v;
