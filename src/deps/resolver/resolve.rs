@@ -178,7 +178,7 @@ pub fn resolve(spec: &str, ctx: &ResolveCtx<'_>, idx: &SuffixIndex) -> Option<Pa
         .then_with(|| a.3.cmp(&b.3))
     });
     for (_, _, _, key) in candidates {
-      if let Some(found) = find_dir_file(idx, &key) {
+      if let Some(found) = find_dir_file(idx, &key, ctx.from_file) {
         return Some(found);
       }
     }
@@ -390,24 +390,18 @@ fn resolve_relative(
 }
 
 /// For Go: given a relative directory like `pkg/foo`, return any source
-/// file inside it that we've indexed.
-fn find_dir_file(idx: &SuffixIndex, rel_dir: &str) -> Option<PathBuf> {
+/// file inside it that we've indexed, the lexicographically first one. The
+/// importer comes last: an external test package (`package foo_test`)
+/// imports its own directory, and the caller drops a self-edge, so the
+/// import would be lost when the importer sorts first.
+fn find_dir_file(idx: &SuffixIndex, rel_dir: &str, importer: &Path) -> Option<PathBuf> {
   let dir_abs = idx.root.join(rel_dir);
-  let mut best: Option<PathBuf> = None;
-  for f in idx.by_file.keys() {
-    if f.starts_with(&dir_abs) && f.parent() == Some(dir_abs.as_path()) {
-      // Prefer non-test-file by name; otherwise lexicographic.
-      match &best {
-        None => best = Some(f.clone()),
-        Some(prev) => {
-          if f < prev {
-            best = Some(f.clone());
-          }
-        }
-      }
-    }
-  }
-  best
+  idx
+    .by_file
+    .keys()
+    .filter(|f| f.parent() == Some(dir_abs.as_path()))
+    .min_by_key(|f| (f.as_path() == importer, f.as_path()))
+    .cloned()
 }
 
 /// How many leading components two paths share. The measure of "nearest

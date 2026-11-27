@@ -266,6 +266,22 @@ fn go_import_of_the_module_root_package_resolves() {
   );
 }
 
+#[test]
+fn go_external_test_package_keeps_the_import_of_its_own_directory() {
+  // `api_test.go` (`package shop_test`) imports its own directory and sorts
+  // before `shop.go`. A Go import resolves to one file of the directory;
+  // when that file is the importer, the self-edge is dropped and the
+  // import is lost.
+  let s = run_ok(&[
+    "deps",
+    "tests/fixtures/deps/go_external_test/shop/api_test.go",
+    "--depth",
+    "1",
+    "--rebuild",
+  ]);
+  assert!(s.contains("shop/shop.go"), "expected shop/shop.go:\n{s}");
+}
+
 // ---- Graph emission ----
 
 #[test]
